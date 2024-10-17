@@ -1,41 +1,50 @@
 # app/routers/music.py
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from .. import schemas, models, dependencies, auth
-import os
 from typing import List
-import requests
+from .. import schemas, models, dependencies, auth
+from transformers import pipeline
+import scipy.io.wavfile
+import os
 
 router = APIRouter(
     prefix="/music",
     tags=["music"]
 )
 
-META_API_KEY = os.getenv("META_API_KEY")
-META_API_URL = "https://api.meta.com/generate_music"  # Replace with actual Meta API endpoint
+# Initialize the MusicGen model using Hugging Face's pipeline
+synthesizer = pipeline("text-to-audio", model="facebook/musicgen-small")
 
 @router.post("/generate", response_model=schemas.MusicOut)
 def generate_music(music: schemas.MusicCreate, db: Session = Depends(dependencies.get_db), current_user: models.User = Depends(auth.get_current_user)):
-    # Call Meta API to generate music from prompt
-    headers = {"Authorization": f"Bearer {META_API_KEY}"}
-    payload = {"prompt": music.prompt}
-    response = requests.post(META_API_URL, json=payload, headers=headers)
-    
-    if response.status_code != 200:
-        raise HTTPException(status_code=400, detail="Failed to generate music")
-    
-    data = response.json()
-    music_url = data.get("music_url")  # Adjust based on Meta API response
+    try:
+        # Use the MusicGen model to generate music from the prompt
+        generated_music = synthesizer(music.prompt, forward_params={"do_sample": True})
+        
+        # Extract audio data and sampling rate
+        audio_data = generated_music["audio"]
+        sampling_rate = generated_music["sampling_rate"]
+        
+        # Save the generated audio as a .wav file
+        music_filename = f"musicgen_{current_user.id}_{music.prompt}.wav"
+        music_filepath = os.path.join("generated_music", music_filename)  # Ensure this directory exists
+        scipy.io.wavfile.write(music_filepath, rate=sampling_rate, data=audio_data)
 
-    new_music = models.Music(
-        prompt=music.prompt,
-        music_url=music_url,
-        owner_id=current_user.id
-    )
-    db.add(new_music)
-    db.commit()
-    db.refresh(new_music)
-    return new_music
+        # Save the music details in the database
+        new_music = models.Music(
+            prompt=music.prompt,
+            music_url=music_filepath,  # Save the file path or a URL if you're storing the file in a cloud service
+            owner_id=current_user.id
+        )
+        db.add(new_music)
+        db.commit()
+        db.refresh(new_music)
+
+        return new_music
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate music: {str(e)}")
+
 
 @router.post("/{music_id}/add_vocals", response_model=schemas.MusicOut)
 def add_vocals(music_id: int, vocals_file: bytes, db: Session = Depends(dependencies.get_db), current_user: models.User = Depends(auth.get_current_user)):
